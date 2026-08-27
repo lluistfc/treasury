@@ -6,12 +6,13 @@ Original code is BSD 3-Clause licensed; see LICENSE-WINDOWER.
 
 addon.name = 'treasury'
 addon.author = 'Ihina; Windower contributors; Ashita v4 port'
-addon.version = '1.1.0'
+addon.version = '1.2.0'
 addon.desc = 'Manages configured treasure-pool items and removes unwanted inventory items.'
 
 require 'common'
 
 local chat = require 'chat'
+local imgui = require 'imgui'
 local settings = require 'settings'
 
 local defaults = T {
@@ -32,6 +33,10 @@ local state = {
     drop_queue = {},
     drop_handled = {},
     inventory_counter = nil,
+    config_open = { false },
+    inventory_open = { false },
+    rule_rows = { pass = {}, lot = {}, drop = {} },
+    rule_pages = { pass = 1, lot = 1, drop = 1 },
 }
 
 local groups = {
@@ -71,16 +76,77 @@ local function rebuild()
     state.pass_ids = build_id_set(state.settings.pass)
     state.lot_ids = build_id_set(state.settings.lot)
     state.drop_ids = build_id_set(state.settings.drop)
+    for _, kind in ipairs { 'pass', 'lot', 'drop' } do
+        local rows = {}
+        for id, _ in pairs(state[kind .. '_ids']) do
+            table.insert(rows, { id = id, name = item_name(id) })
+        end
+        table.sort(rows, function(left, right)
+            local left_name = left.name:lower()
+            local right_name = right.name:lower()
+            return left_name == right_name and left.id < right.id or left_name < right_name
+        end)
+        state.rule_rows[kind] = rows
+    end
 end
+
+local scan_pool
+local scan_inventory
 
 settings.register('settings', 'settings_update', function(s)
     state.settings = s
     rebuild()
+    state.queue = {}
+    state.handled = {}
+    state.drop_queue = {}
+    state.drop_handled = {}
+    if scan_pool ~= nil then
+        scan_pool()
+    end
+    if scan_inventory ~= nil then
+        scan_inventory()
+    end
 end)
 
 local function save()
     settings.save()
     rebuild()
+end
+
+local function refresh_rules(kind)
+    if kind == 'drop' then
+        state.drop_queue = {}
+        state.drop_handled = {}
+        scan_inventory()
+    else
+        state.queue = {}
+        state.handled = {}
+        scan_pool()
+    end
+end
+
+local function save_rules(kind)
+    save()
+    refresh_rules(kind)
+end
+
+local function remove_id(kind, id)
+    local list = state.settings[kind]
+    for index = #list, 1, -1 do
+        if tonumber(list[index]) == id then
+            table.remove(list, index)
+        end
+    end
+    save_rules(kind)
+end
+
+local function add_drop_id(id)
+    if state.drop_ids[id] then
+        return false
+    end
+    state.settings.drop:append(id)
+    save_rules 'drop'
+    return true
 end
 
 local function print_message(message)
@@ -150,9 +216,6 @@ local function list_contains(list, id)
     return false
 end
 
-local scan_pool
-local scan_inventory
-
 local function mutate(kind, operation, query)
     local ids = find_ids(query)
     local count = 0
@@ -174,12 +237,7 @@ local function mutate(kind, operation, query)
         print_error 'No matching items were changed.'
         return
     end
-    save()
-    if kind == 'drop' then
-        scan_inventory()
-    else
-        scan_pool()
-    end
+    save_rules(kind)
     print_message(
         ('%s %u item(s) %s the %s list.'):format(
             operation == 'add' and 'Added' or 'Removed',
@@ -309,13 +367,151 @@ local function print_list(kind)
 end
 
 local function print_help()
-    print_message 'Commands:'
-    print_message '/tr pass/lot/drop add/remove <item name, id, wildcard, group, or pool>'
-    print_message '/tr pass/lot/drop list/clear'
-    print_message '/tr passall/lotall/done'
-    print_message '/tr clean (or dropall) - Drop all Inventory matches'
-    print_message '/tr delay <seconds>; verbose [on/off]; reload'
-    print_message 'Groups: crystals, seals, currency, geodes, avatarites, detritus, heroism'
+    print_message(table.concat({
+        'Commands:',
+        '  /tr config                         Open configuration',
+        '  /tr inventory                      Open main Inventory list',
+        '  /tr <pass|lot|drop> add <query>    Add matching items',
+        '  /tr <pass|lot|drop> remove <query> Remove matching items',
+        '  /tr <pass|lot|drop> list           Show configured items',
+        '  /tr <pass|lot|drop> clear          Clear configured items',
+        '  /tr <passall|lotall|done>          Act on the treasure pool',
+        '  /tr clean                          Drop matching Inventory stacks',
+        '  /tr delay <seconds>                Set action delay',
+        '  /tr verbose [on|off]               Toggle verbose output',
+        '  /tr reload                         Reload settings',
+        'Queries: item name, ID, wildcard, group, or pool',
+        'Groups: crystals, seals, currency, geodes, avatarites, detritus, heroism',
+    }, '\n'))
+end
+
+local function draw_rule_list(kind)
+    local rows = state.rule_rows[kind]
+    local page_size = 100
+    local page_count = math.max(1, math.ceil(#rows / page_size))
+    state.rule_pages[kind] = math.min(state.rule_pages[kind], page_count)
+    local page = state.rule_pages[kind]
+    imgui.Text(('%u configured item(s)'):format(#rows))
+    if page_count > 1 then
+        imgui.SameLine()
+        if imgui.SmallButton('Previous##' .. kind) and page > 1 then
+            page = page - 1
+        end
+        imgui.SameLine()
+        imgui.Text(('Page %u/%u'):format(page, page_count))
+        imgui.SameLine()
+        if imgui.SmallButton('Next##' .. kind) and page < page_count then
+            page = page + 1
+        end
+        state.rule_pages[kind] = page
+    end
+    imgui.Separator()
+    imgui.BeginChild('##' .. kind .. '_rules', { 420, 300 }, ImGuiChildFlags_Borders)
+    local remove = nil
+    local first = (page - 1) * page_size + 1
+    local last = math.min(page * page_size, #rows)
+    for index = first, last do
+        local row = rows[index]
+        if imgui.SmallButton(('Remove##%s_%u'):format(kind, row.id)) then
+            remove = row.id
+        end
+        imgui.SameLine()
+        imgui.Text(('%s [%u]'):format(row.name, row.id))
+    end
+    imgui.EndChild()
+    if remove ~= nil then
+        remove_id(kind, remove)
+    end
+end
+
+local function draw_config_window()
+    if not state.config_open[1] then
+        return
+    end
+    if imgui.Begin('Treasury Configuration##treasury_config', state.config_open) then
+        if imgui.Button 'Open Inventory List' then
+            state.inventory_open[1] = true
+        end
+        imgui.SameLine()
+        imgui.Text 'Use the tabs to review or remove configured items.'
+        if imgui.BeginTabBar '##treasury_rule_tabs' then
+            if imgui.BeginTabItem 'Pass' then
+                draw_rule_list 'pass'
+                imgui.EndTabItem()
+            end
+            if imgui.BeginTabItem 'Lot' then
+                draw_rule_list 'lot'
+                imgui.EndTabItem()
+            end
+            if imgui.BeginTabItem 'Drop' then
+                draw_rule_list 'drop'
+                imgui.EndTabItem()
+            end
+            imgui.EndTabBar()
+        end
+    end
+    imgui.End()
+end
+
+local function inventory_rows()
+    local result = {}
+    local inventory = AshitaCore:GetMemoryManager():GetInventory()
+    local resources = AshitaCore:GetResourceManager()
+    if inventory == nil then
+        return result
+    end
+    local maximum = tonumber(inventory:GetContainerCountMax(0)) or 0
+    for slot = 1, maximum do
+        local entry = inventory:GetContainerItem(0, slot)
+        local id = entry and tonumber(entry.Id) or 0
+        local resource = is_valid_item_id(id) and resources:GetItemById(id) or nil
+        local equipment_slots = resource and tonumber(resource.Slots) or 0
+        if is_valid_item_id(id) and equipment_slots == 0 then
+            table.insert(result, {
+                id = id,
+                slot = slot,
+                count = tonumber(entry.Count) or 1,
+                name = item_name(id),
+            })
+        end
+    end
+    table.sort(result, function(left, right)
+        local left_name = left.name:lower()
+        local right_name = right.name:lower()
+        return left_name == right_name and left.slot < right.slot or left_name < right_name
+    end)
+    return result
+end
+
+local function draw_inventory_window()
+    if not state.inventory_open[1] then
+        return
+    end
+    if imgui.Begin('Treasury Inventory##treasury_inventory', state.inventory_open) then
+        imgui.Text 'Main Inventory items'
+        imgui.SameLine()
+        if imgui.SmallButton 'Refresh##inventory' then
+            state.inventory_counter = nil
+        end
+        imgui.Separator()
+        imgui.BeginChild('##treasury_inventory_list', { 480, 360 }, ImGuiChildFlags_Borders)
+        local rows = inventory_rows()
+        if #rows == 0 then
+            imgui.TextDisabled 'Inventory is empty or unavailable.'
+        end
+        for _, row in ipairs(rows) do
+            if state.drop_ids[row.id] then
+                imgui.TextDisabled 'Added'
+            elseif imgui.SmallButton(('Add##inventory_%u_%u'):format(row.slot, row.id)) then
+                add_drop_id(row.id)
+            end
+            imgui.SameLine()
+            imgui.Text(('%s x%u [%u]'):format(row.name, row.count, row.id))
+        end
+        imgui.EndChild()
+        imgui.TextWrapped 'Adding an item schedules matching stacks for removal. Dropping is destructive.'
+    end
+    imgui.End()
 end
 
 ashita.events.register('load', 'load_cb', function()
@@ -349,6 +545,9 @@ ashita.events.register('packet_in', 'packet_in_cb', function(e)
 end)
 
 ashita.events.register('d3d_present', 'present_cb', function()
+    draw_config_window()
+    draw_inventory_window()
+
     local now = os.clock()
     local inventory = AshitaCore:GetMemoryManager():GetInventory()
     if inventory ~= nil then
@@ -425,7 +624,7 @@ ashita.events.register('command', 'command_cb', function(e)
             print_list(kind)
         elseif operation == 'clear' then
             state.settings[kind] = T {}
-            save()
+            save_rules(kind)
             print_message(kind .. ' list cleared.')
         else
             print_help()
@@ -437,6 +636,10 @@ ashita.events.register('command', 'command_cb', function(e)
         else
             print_message 'No items in the main Inventory match the drop list.'
         end
+    elseif command:any('config', 'settings', 'ui') then
+        state.config_open[1] = not state.config_open[1]
+    elseif command:any('inventory', 'inv') then
+        state.inventory_open[1] = not state.inventory_open[1]
     elseif command:any('passall', 'lotall', 'done') then
         local inventory = AshitaCore:GetMemoryManager():GetInventory()
         if inventory ~= nil then
@@ -474,8 +677,8 @@ ashita.events.register('command', 'command_cb', function(e)
         print_message('Verbose output ' .. (state.settings.verbose and 'enabled.' or 'disabled.'))
     elseif command:any('reload', 'rl') then
         settings.reload()
-        scan_pool()
-        scan_inventory()
+        refresh_rules 'pass'
+        refresh_rules 'drop'
         print_message 'Settings reloaded.'
     elseif command:any('help', 'h') then
         print_help()
